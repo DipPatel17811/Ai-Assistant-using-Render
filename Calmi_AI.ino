@@ -1,140 +1,142 @@
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <Wire.h>
 #include <hd44780.h>
 #include <hd44780ioClass/hd44780_I2Cexp.h>
 
-hd44780_I2Cexp lcd;
-ESP8266WebServer server(80);
+hd44780_I2Cexp lcd;  // Auto I2C address detection
+const int LCD_COLS = 16;
+const int LCD_ROWS = 2;
 
-String ssid = "";
-String password = "";
+String ssid, password;
+const String serverURL = "https://calmi-ai.onrender.com/ask?q=";
+String userInput = "";
+String fullAnswer = "";
+unsigned long scrollTimer = 0;
+int scrollIndex = 0;
+bool scrolling = false;
 
-void startupAnimation() {
+void setup() {
+  Serial.begin(115200);
+  lcd.begin(LCD_COLS, LCD_ROWS);
   lcd.clear();
-  String msg = "Starting Calmi AI...";
-  for (int i = 0; i < msg.length(); i++) {
-    lcd.setCursor(i % 16, i / 16);
-    lcd.print(msg[i]);
-    delay(100);
-  }
-  delay(1000);
+  lcd.print("Enter SSID:");
+  waitForSerialInput(ssid);
   lcd.clear();
-  lcd.print("WiFi Ready...");
+  lcd.print("Enter PASS:");
+  waitForSerialInput(password);
+
+  connectWiFi();
+  lcd.clear();
+  lcd.print("Ask Gemini:");
 }
 
-void scrollText(String text) {
-  int len = text.length();
-  if (len <= 16) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print(text);
-    return;
+void loop() {
+  if (Serial.available()) {
+    userInput = Serial.readStringUntil('\n');
+    userInput.trim();
+
+    if (userInput.length() > 0) {
+      lcd.clear();
+      lcd.print("Thinking...");
+      fullAnswer = askGemini(userInput);
+      scrollIndex = 0;
+      scrolling = true;
+      scrollTimer = millis();
+    }
   }
 
-  for (int i = 0; i <= len - 16; i++) {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print(text.substring(i, i + 16));
-    delay(300);
+  // Scroll long messages
+  if (scrolling && millis() - scrollTimer > 500) {
+    scrollTimer = millis();
+    if (scrollIndex < fullAnswer.length()) {
+      lcd.clear();
+      lcd.print(fullAnswer.substring(scrollIndex, scrollIndex + LCD_COLS));
+      if (fullAnswer.length() - scrollIndex > LCD_COLS) {
+        lcd.setCursor(0, 1);
+        lcd.print(fullAnswer.substring(scrollIndex + LCD_COLS, scrollIndex + LCD_COLS * 2));
+      }
+      scrollIndex++;
+    } else {
+      scrolling = false;
+      lcd.clear();
+      lcd.print("Ask Gemini:");
+    }
   }
 }
 
-void connectToWiFi(String ssid, String password) {
+void waitForSerialInput(String &inputVar) {
+  inputVar = "";
+  while (inputVar.length() == 0) {
+    if (Serial.available()) {
+      inputVar = Serial.readStringUntil('\n');
+      inputVar.trim();
+    }
+  }
+}
+
+void connectWiFi() {
   lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Connecting...");
+  lcd.print("Connecting WiFi");
   WiFi.begin(ssid.c_str(), password.c_str());
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries++ < 30) {
     delay(500);
     lcd.print(".");
-    Serial.print(".");
-    attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
     lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Connected!");
-    lcd.setCursor(0, 1);
-    lcd.print(WiFi.localIP());
-    Serial.println("\n✅ Connected: " + WiFi.localIP().toString());
-    delay(1500);
-    startupAnimation();
-
-    if (MDNS.begin("calmi")) {
-      Serial.println("✅ mDNS responder started: http://calmi.local");
-      lcd.clear();
-      lcd.print("mDNS: calmi.local");
-    } else {
-      Serial.println("❌ mDNS failed.");
-    }
+    lcd.print("WiFi Connected!");
+    delay(1000);
   } else {
     lcd.clear();
-    lcd.print("❌ WiFi Failed!");
-    Serial.println("\n❌ WiFi failed.");
+    lcd.print("WiFi Failed!");
+    while (true);
   }
 }
 
-void setup() {
-  Serial.begin(115200);
-  lcd.begin(16, 2);
-  lcd.backlight();
-  lcd.setCursor(0, 0);
-  lcd.print("Enter SSID:");
+String askGemini(String question) {
+  HTTPClient http;
+  String fullURL = serverURL + urlencode(question);
+  http.begin(fullURL);
+  int httpCode = http.GET();
 
-  // Read SSID from Serial Monitor
-  while (ssid == "") {
-    if (Serial.available()) {
-      ssid = Serial.readStringUntil('\n');
-      ssid.trim();
-      Serial.println("✔️ SSID: " + ssid);
-      lcd.clear();
-      lcd.print("Enter PASS:");
+  if (httpCode == 200) {
+    String payload = http.getString();
+    Serial.println("Raw: " + payload);
+
+    int start = payload.indexOf("{\"response\":\"") + 13;
+    int end = payload.lastIndexOf("\"}");
+
+    if (start > 12 && end > start) {
+      String answer = payload.substring(start, end);
+      answer.replace("\\n", " ");
+      answer.replace("\\\"", "\"");
+      answer.trim();
+      return answer;
     }
+    return "Parse error!";
+  } else {
+    return "HTTP error " + String(httpCode);
   }
 
-  // Read Password from Serial Monitor
-  while (password == "") {
-    if (Serial.available()) {
-      password = Serial.readStringUntil('\n');
-      password.trim();
-      Serial.println("✔️ Password received");
-    }
-  }
+  http.end();
+}
 
-  connectToWiFi(ssid, password);
-
-  // Setup web endpoint
-  server.on("/update", []() {
-    if (server.hasArg("text")) {
-      String txt = server.arg("text");
-      Serial.println("📥 Received: " + txt);
-      scrollText(txt);
-      server.send(200, "text/plain", "Displayed: " + txt);
+String urlencode(String str) {
+  String encoded = "";
+  char c;
+  char buf[4];
+  for (size_t i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c)) {
+      encoded += c;
     } else {
-      server.send(400, "text/plain", "Missing 'text' param");
-    }
-  });
-
-  server.begin();
-  Serial.println("🌐 HTTP server started");
-}
-
-void loop() {
-  server.handleClient();
-
-  // Optional: Show Serial Monitor input on LCD
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-    if (input.length() > 0) {
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print(input);
+      sprintf(buf, "%%%02X", c);
+      encoded += buf;
     }
   }
+  return encoded;
 }
